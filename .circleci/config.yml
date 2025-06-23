@@ -1,66 +1,199 @@
-# This config was automatically generated from your source code
-# Stacks detected: cicd:github-actions:.github/workflows,cicd:gitlab-workflows:.,deps:node:.,test:jest:
 version: 2.1
+
 orbs:
-  node: circleci/node@5
-jobs:
-  test-node:
-    # Install node dependencies and run tests
-    executor: node/default
-    environment:
-      JEST_JUNIT_OUTPUT_DIR: ./test-results/
-    steps:
-      - checkout
-      - node/install-packages:
-          pkg-manager: npm
-      - run:
-          command: npm install jest-junit
-      - run:
-          name: Run tests
-          command: npm run test --ci --runInBand --reporters=default --reporters=jest-junit
-      - store_test_results:
-          path: ./test-results/
-  build-node:
-    # Build node project
-    executor: node/default
-    steps:
-      - checkout
-      - node/install-packages:
-          pkg-manager: npm
-      - run:
-          command: npm run build
-      - run:
-          name: Create the ~/artifacts directory if it doesn't exist
-          command: mkdir -p ~/artifacts
-      # Copy output to artifacts dir
-      - run:
-          name: Copy artifacts
-          command: cp -R build dist public .output .next .docusaurus ~/artifacts 2>/dev/null || true
-      - store_artifacts:
-          path: ~/artifacts
-          destination: node-build
-  deploy:
-    # This is an example deploy job, not actually used by the workflow
+  node: circleci/node@5          # Convenience for caching & install
+  slack: circleci/slack@4        # Optional – remove if unused
+
+executors:
+  node20:
     docker:
-      - image: cimg/base:stable
+      - image: cimg/node:20.10      # Primary container
+      - image: mysql:5.7            # Service container
+        name: mysql
+        environment:
+          MYSQL_DATABASE: test_db
+          MYSQL_USER: user
+          MYSQL_PASSWORD: password
+          MYSQL_ROOT_PASSWORD: rootpassword
+    environment:
+      NX_BASE: trunk                # Filled at run-time
+    working_directory: ~/repo
+
+commands:
+  prepare_playground:
+    description: "Clone, install dependencies, seed NX vars"
+    parameters:
+      node_version:
+        type: string
+        default: "20"
     steps:
-      # Replace this with steps to deploy to users
+      - checkout
+      - run: git fetch origin trunk --depth=1 --recurse-submodules
+      - node/install:
+          node-version: <<parameters.node_version>>
+      - restore_cache:
+          keys:
+            - node-{{ arch }}-{{ checksum "package-lock.json" }} # :contentReference[oaicite:1]{index=1}
+            - node-
+      - run: npm ci
+      - save_cache:
+          key: node-{{ arch }}-{{ checksum "package-lock.json" }}
+          paths: node_modules
       - run:
-          name: deploy
-          command: '#e.g. ./deploy.sh'
+          name: Set NX vars
+          command: |
+            echo "export NX_BASE=$(git rev-parse origin/trunk)" >> $BASH_ENV
+            echo "export NX_HEAD=$(git rev-parse HEAD)" >> $BASH_ENV
+      - run: npx nx reset
+
+jobs:
+  lint_typecheck:
+    executor: node20
+    steps:
+      - prepare_playground
+      - run: npx nx affected --target=lint
+      - run: npx nx affected --target=typecheck
+
+  test_unit_asyncify:
+    executor: node20
+    parameters:
+      target:
+        type: string
+    steps:
+      - prepare_playground
       - run:
-          name: found github actions config
-          command: ':'
-      - run:
-          name: found gitlab workflows config
-          command: ':'
+          name: Run unit target
+          command: node --expose-gc node_modules/nx/bin/nx affected --target=<<parameters.target>>
+          environment:
+            MYSQL_DATABASE: test_db
+            MYSQL_USER: user
+            MYSQL_PASSWORD: password
+
+  test_e2e_cypress:
+    executor: node20
+    steps:
+      - prepare_playground
+      - run: sudo ./node_modules/.bin/cypress install --force
+      - run: sudo CYPRESS_CI=1 npx nx e2e playground-website --configuration=ci --verbose
+      - when:
+          condition: not success
+          steps:
+            - store_artifacts:
+                path: dist/cypress/packages/playground/website/screenshots
+
+  test_e2e_playwright_prepare:
+    executor: node20
+    steps:
+      - prepare_playground
+      - run: sudo npx playwright install --with-deps
+      - run: CORS_PROXY_URL=http://127.0.0.1:5263/cors-proxy.php? \
+             npx nx e2e:playwright:prepare-app-deploy-and-offline-mode playground-website
+      - run: tar -czf dist.tar.gz dist
+      - persist_to_workspace:
+          root: .
+          paths: dist.tar.gz
+
+  test_e2e_playwright:
+    executor: node20
+    parameters:
+      browser:
+        type: enum
+        enum: ["chromium", "firefox", "webkit"]
+    steps:
+      - attach_workspace:
+          at: .
+      - prepare_playground
+      - run: sudo npx playwright install <<parameters.browser>> --with-deps
+      - run: >
+          if [ "<<parameters.browser>>" = "firefox" ];
+          then sudo -E HOME=/root XDG_RUNTIME_DIR=/root CI=true
+               npx playwright test --project=<<parameters.browser>> \
+               --config=packages/playground/website/playwright/playwright.ci.config.ts;
+          else sudo CI=true npx playwright test --project=<<parameters.browser>> \
+               --config=packages/playground/website/playwright/playwright.ci.config.ts; fi
+      - store_artifacts:
+          path: packages/playground/website/playwright-report
+          destination: report_<<parameters.browser>>
+
+  test_built_npm_packages:
+    executor: node20
+    steps:
+      - prepare_playground
+      - run: |
+          VERSION=$(date +%s)
+          PORT=9934
+          PACKAGE_BASE_URL=http://127.0.0.1:$PORT/$VERSION
+          echo "export VERSION=$VERSION" >> $BASH_ENV
+          echo "export PORT=$PORT" >> $BASH_ENV
+          echo "export PACKAGE_BASE_URL=$PACKAGE_BASE_URL" >> $BASH_ENV
+      - run: npx nx run-many --all --target=package-for-self-hosting -- --hostingBaseUrl="$PACKAGE_BASE_URL"
+      - run: |
+          bun install -q
+          bun ./packages/playground/cli/src/cli.ts server --port=$PORT --mount="./dist/packages-for-self-hosting/http%3A%2F%2F127.0.0.1%3A$PORT%2F$VERSION:/wordpress/$VERSION" --quiet &
+      - run: ./packages/playground/test-built-npm-packages/es-modules-and-vitest/test.sh
+      - run: ./packages/playground/test-built-npm-packages/commonjs-and-jest/test.sh
+
+  test_unbuilt_cli:
+    executor: node20
+    steps:
+      - prepare_playground
+      - run: packages/playground/cli/src/test/test-running-unbuilt-cli.sh
+
+  build:
+    executor: node20
+    steps:
+      - prepare_playground
+      - run: |
+          if ADDITIONAL_REMOTE_ORIGINS=invalid-origin npx nx build playground-client;
+          then echo "Build should have failed but succeeded" && exit 1;
+          fi
+      - run: npx nx affected --target=build --parallel=3 --verbose
+
 workflows:
-  build-and-test:
+  version: 2
+  ci:
     jobs:
-      - test-node
-      - build-node:
+      - lint_typecheck
+      - test_unit_asyncify:
+          matrix:
+            parameters:
+              target:
+                [
+                  test,
+                  test-php,
+                  test-php-request-handler-files,
+                  test-php-request-handler-requests,
+                  test-php-asyncify-file-get-contents-http,
+                  test-php-asyncify-file-get-contents-https,
+                  test-php-asyncify-fopen-http,
+                  test-php-asyncify-fopen-https,
+                  test-php-asyncify-fsockopen-http,
+                  test-php-asyncify-fsockopen-https,
+                  test-php-asyncify-gethostbyname-http,
+                  test-php-asyncify-gethostbyname-https,
+                  test-php-asyncify-mysqli-http,
+                  test-php-asyncify-mysqli-https,
+                ]
           requires:
-            - test-node
-    # - deploy:
-    #     requires:
-    #       - build-node
+            - lint_typecheck
+      - test_e2e_cypress:
+          requires:
+            - lint_typecheck
+      - test_e2e_playwright_prepare:
+          requires:
+            - lint_typecheck
+      - test_e2e_playwright:
+          matrix:
+            parameters:
+              browser: ["chromium", "firefox", "webkit"]
+          requires:
+            - test_e2e_playwright_prepare
+      - test_built_npm_packages:
+          requires:
+            - lint_typecheck
+      - test_unbuilt_cli:
+          requires:
+            - lint_typecheck
+      - build:
+          requires:
+            - lint_typecheck
